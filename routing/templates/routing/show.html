@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>USA Route Finder</title>
+    <!-- Load Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f9f9f9; }
+        #controls { margin-bottom: 20px; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        input[type="text"] { padding: 10px; width: 250px; margin-right: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        #map { height: 500px; width: 100%; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #status { margin-top: 15px; font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+
+    <h2>Find Route (USA Only)</h2>
+    
+    <div id="controls">
+        <input type="text" id="start-input" placeholder="Start (e.g. New York, NY)" value="New York, NY">
+        <input type="text" id="end-input" placeholder="End (e.g. Washington, DC)" value="Washington, DC">
+        <button onclick="findRoute()">Get Route</button>
+        <div id="status">Enter locations and click Get Route.</div>
+    </div>
+
+    <div id="map"></div>
+
+    <!-- Load Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script>
+        // 1. Initialize Map (centered on USA)
+        const map = L.map('map').setView([39.8283, -98.5795], 4); 
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        let routeLayer = null; // Keeps track of the drawn line
+
+        async function findRoute() {
+            const start = document.getElementById('start-input').value;
+            const end = document.getElementById('end-input').value;
+            const statusDiv = document.getElementById('status');
+
+            if (!start || !end) {
+                statusDiv.innerText = "Please enter both locations.";
+                return;
+            }
+
+            statusDiv.innerText = "Calculating route... (This takes a few seconds)";
+
+            // 2. Prepare data for POST request
+            // URLSearchParams formats the data exactly like Django's request.POST expects it
+            const params = new URLSearchParams();
+            params.append('start', start);
+            params.append('end', end);
+
+            try {
+                // 3. Send POST request to your Django API
+                const response = await fetch('/api/route/', {
+                    method: 'POST',
+                    body: params 
+                    
+                });
+                console.log("Response status:", response.status);
+                const data = await response.json();
+                // console.log("Received data:", data);
+
+                // 4. Handle Errors
+                if (data.error) {
+                    statusDiv.innerText = "Error: " + data.error;
+                    statusDiv.style.color = "red";
+                    return;
+                }
+
+                // 5. Update Text
+                statusDiv.style.color = "green";
+                statusDiv.innerText = `Distance: ${data.distance} miles | Duration: ${data.duration} hours`;
+
+                // 6. Draw the Map Line
+                if (routeLayer) {
+                    map.removeLayer(routeLayer); // Remove old line
+                }
+
+                // data.map_geometry is the exact GeoJSON LineString from OSRM
+                routeLayer = L.geoJSON(data.geometry, {
+                    style: { color: 'blue', weight: 5, opacity: 0.7 }
+                }).addTo(map);
+
+                // Zoom camera to fit the line perfectly
+                map.fitBounds(routeLayer.getBounds(), { padding: [50, 50] });
+
+            } catch (error) {
+                statusDiv.style.color = "red";
+                statusDiv.innerText = "Failed to connect to server. Is Django running?";
+                console.error(error);
+            }
+        }
+    </script>
+</body>
+</html>
