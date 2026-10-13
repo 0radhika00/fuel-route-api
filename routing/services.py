@@ -4,6 +4,9 @@ from pprint import pprint
 from sklearn.neighbors import BallTree
 import math
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 BUFFER_MILES = 20 
 EARTH_RADIUS_MILES = 3958.8
@@ -35,7 +38,7 @@ def geocoding(address):
         else:
             return None
     except requests.exceptions.RequestException as e:
-        print(f"Error occurred during geocoding: {e}")
+        logger.exception(f"Error occurred during geocoding: {e}")
 
 def get_map(start,end,profile="driving"):
 
@@ -52,7 +55,7 @@ def get_map(start,end,profile="driving"):
 
         return {"distance": data["routes"][0]["distance"]/1609.34, "duration": data["routes"][0]["duration"]/3600, "geometry": data["routes"][0]["geometry"]}
     except requests.exceptions.RequestException as e:
-        print(f"Error occurred during routing: {e}")
+        logger.exception(f"Error occurred during routing: {e}")
 
 def get_cumulative_distance(path_coordinates):
 
@@ -83,7 +86,7 @@ def get_cumulative_distance(path_coordinates):
         cumulative_distance.append(new_segment)
 
  
-    print("Cummulative_distance",len(cumulative_distance))
+    logger.debug("Cummulative_distance: %d", len(cumulative_distance))
     return cumulative_distance
 
 def get_nearby_stations(path_coordinates,cumulative_distance):
@@ -94,7 +97,7 @@ def get_nearby_stations(path_coordinates,cumulative_distance):
 
     #ball tree
     tree = BallTree(route_radians, metric='haversine')
-    print("tree created")
+    logger.debug("Tree created")
     with open('data/stations.json') as f:
         station_data = json.load(f)
 
@@ -115,50 +118,66 @@ def get_nearby_stations(path_coordinates,cumulative_distance):
                                     "station_name":station_data[i]["name"],
                                     "station_address":str(station_data[i]["address"] +" "+ station_data[i]["city"] +" "+ station_data[i]["state"])})
 
-    print("Nearby Station Created")
+    logger.info("Nearby Stations Created: %d", len(nearby_stations))
     return nearby_stations
 
 
 def list_of_stations(nearby_stations,total_distance):
 
     sorted_dic_idx = sorted(nearby_stations, key=lambda d: d['cummulative_idx'])
+    filtered_data = {}
 
+    
+    for station in sorted_dic_idx:
+        idx = station['cummulative_idx']
+        # print(idx, station['station_price'])
+        if idx not in filtered_data or station['station_price'] < filtered_data[idx]['station_price']:
+            filtered_data[idx] = station
 
+    filtered_stations = list(filtered_data.values())
+
+    # for _ in sorted_dic_idx:
+    #     print(_)
+
+    # for _ in filtered_stations:
+    #     print(_)
     final_list = []
     total_cost = 0
     position = 0            # cumulative distance where we currently stand
     i = 0
-    n = len(sorted_dic_idx)
+    n = len(filtered_stations)
+    edge_capacity = 0
 
     while position < total_distance:
 
-        if total_distance - position <= MAX_CAPACITY:
+        if total_distance - position <= MAX_CAPACITY - edge_capacity:
             break
 
         intial_price = 1e9
         intial_station = None
 
         j = i
-        while j < n and sorted_dic_idx[j]['cummulative_idx'] <= position + MAX_CAPACITY:
-            if sorted_dic_idx[j]['cummulative_idx'] > position:
-                if sorted_dic_idx[j]['station_price'] < intial_price:
-                    intial_price = sorted_dic_idx[j]['station_price']
-                    intial_station = sorted_dic_idx[j]
+        while j < n and filtered_stations[j]['cummulative_idx'] <= position + MAX_CAPACITY - edge_capacity:
+            if filtered_stations[j]['cummulative_idx'] > position:
+                if filtered_stations[j]['station_price'] < intial_price:
+                    intial_price = filtered_stations[j]['station_price']
+                    intial_station = filtered_stations[j]
             j += 1
 
         if intial_station is None:
             break
 
         if final_list:
-            leg_miles = intial_station['cummulative_idx'] - position
             prev_stop = final_list[-1]
+            leg_miles = intial_station['cummulative_idx'] - prev_stop['cummulative_idx']
             detour_miles = 2 * prev_stop['station_distance_in_miles']
-            total_cost += ((leg_miles + detour_miles) / MILES_PER_GALLON) * prev_stop['station_price']
+            total_cost += (leg_miles+detour_miles) / MILES_PER_GALLON * prev_stop['station_price']
 
         final_list.append(intial_station)
         position = intial_station['cummulative_idx']
+        edge_capacity = 2*intial_station['station_distance_in_miles']
 
-        while i < n and sorted_dic_idx[i]['cummulative_idx'] <= position:
+        while i < n and filtered_stations[i]['cummulative_idx'] <= position:
             i += 1
 
     if final_list:
@@ -167,8 +186,7 @@ def list_of_stations(nearby_stations,total_distance):
         detour_miles = 2 * last_stop['station_distance_in_miles']
         total_cost += ((leg_miles + detour_miles) / MILES_PER_GALLON) * last_stop['station_price']
 
-    print("Final Stations Created")
-    
+    logger.info("Final Stations Created: %d", len(final_list))
     return final_list, round(total_cost, 2)
 
 
