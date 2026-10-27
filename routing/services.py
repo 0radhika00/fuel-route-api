@@ -5,6 +5,7 @@ from sklearn.neighbors import BallTree
 import math
 import numpy as np
 import logging
+from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,22 @@ MAX_CAPACITY = 500
 MILES_PER_GALLON = 10
 OSRM_BASE_URL = "https://router.project-osrm.org"
 NOMINATION_URL = "https://nominatim.openstreetmap.org/search"
+FILE_PATH = "data/stations.json"
+
+class DataSource(ABC):
+    @abstractmethod
+    def get_data(self):
+        pass
+
+class StationDataSource(DataSource):
+    def __init__(self,FILE_PATH):
+        self.filepath = FILE_PATH
+
+    def get_data(self):
+        with open(self.filepath) as f:
+            station_data = json.load(f)
+        logger.debug("Station data loaded: %d", len(station_data))
+        return station_data
 
 def geocoding(address):
 
@@ -40,6 +57,13 @@ def geocoding(address):
     except requests.exceptions.RequestException as e:
         logger.exception(f"Error occurred during geocoding: {e}")
 
+def convert(data):
+
+    data["routes"][0]["distance"] = data["routes"][0]["distance"]/1609.34
+    data["routes"][0]["duration"] = data["routes"][0]["duration"]/3600
+    
+    return data
+
 def get_map(start,end,profile="driving"):
 
     start_coordinates = geocoding(start)
@@ -52,8 +76,9 @@ def get_map(start,end,profile="driving"):
         response = requests.get(url,timeout=10)
         response.raise_for_status()
         data = response.json()
+        data = convert(data)
 
-        return {"distance": data["routes"][0]["distance"]/1609.34, "duration": data["routes"][0]["duration"]/3600, "geometry": data["routes"][0]["geometry"]}
+        return {"distance": data["routes"][0]["distance"], "duration": data["routes"][0]["duration"], "geometry": data["routes"][0]["geometry"]}
     except requests.exceptions.RequestException as e:
         logger.exception(f"Error occurred during routing: {e}")
 
@@ -89,8 +114,7 @@ def get_cumulative_distance(path_coordinates):
     logger.debug("Cummulative_distance: %d", len(cumulative_distance))
     return cumulative_distance
 
-def get_nearby_stations(path_coordinates,cumulative_distance):
-
+def create_tree(path_coordinates):
 
     route_data = [[i[1],i[0]] for i in path_coordinates]
     route_radians = np.radians(route_data)
@@ -98,14 +122,30 @@ def get_nearby_stations(path_coordinates,cumulative_distance):
     #ball tree
     tree = BallTree(route_radians, metric='haversine')
     logger.debug("Tree created")
-    with open('data/stations.json') as f:
-        station_data = json.load(f)
+    return tree
+    
+# def load_data(file_path):
 
-    station_data_lat_long = [[i['lat'],i['lon']] for i in station_data]
-    station_radians = np.radians(station_data_lat_long)
+#     with open(file_path) as f:
+#         station_data = json.load(f)
+#     logger.debug("Station data loaded: %d", len(station_data))
+#     return station_data
 
+def generate_idx(station_data,tree):
+
+    station_radians = np.radians(station_data)
     distance_rad , idx = tree.query(station_radians, k=1)
-    # print(len(distance_rad))
+    return distance_rad , idx
+
+def get_nearby_stations(path_coordinates,cumulative_distance):
+
+
+    tree = create_tree(path_coordinates)
+    station_data = StationDataSource(FILE_PATH)
+    station_data = station_data.get_data()
+    station_data_lat_long = [[i['lat'],i['lon']] for i in station_data]
+    distance_rad , idx = generate_idx(station_data_lat_long,tree)
+
     nearby_stations = []
 
     for i in range(len(distance_rad)):
@@ -121,72 +161,91 @@ def get_nearby_stations(path_coordinates,cumulative_distance):
     logger.info("Nearby Stations Created: %d", len(nearby_stations))
     return nearby_stations
 
+def generate_filtered_stations(nearby_stations):
+    """Sort by route position and drop stations that are strictly worse
+    than another station at the same mile marker (price AND detour)."""
+    by_idx = {}
+    for s in sorted(nearby_stations, key=lambda d: d['cummulative_idx']):
+        by_idx.setdefault(s['cummulative_idx'], []).append(s)
 
-def list_of_stations(nearby_stations,total_distance):
+    filtered_stations = []
+    for idx in sorted(by_idx):
+        group = by_idx[idx]
+        for s in group:
+            dominated = any(
+                o is not s
+                and o['station_price'] <= s['station_price']
+                and o['station_distance_in_miles'] <= s['station_distance_in_miles']
+                and (o['station_price'] < s['station_price']
+                     or o['station_distance_in_miles'] < s['station_distance_in_miles'])
+                for o in group
+            )
+            if not dominated:
+                filtered_stations.append(s)
 
-    sorted_dic_idx = sorted(nearby_stations, key=lambda d: d['cummulative_idx'])
-    filtered_data = {}
+    logger.info("Filtered Stations Created: %d", len(filtered_stations))
+    return filtered_stations
 
-    
-    for station in sorted_dic_idx:
-        idx = station['cummulative_idx']
-        # print(idx, station['station_price'])
-        if idx not in filtered_data or station['station_price'] < filtered_data[idx]['station_price']:
-            filtered_data[idx] = station
 
-    filtered_stations = list(filtered_data.values())
+def reach(station):
+    # range left after fueling here: the off-route detour already used some
+    return MAX_CAPACITY - 2 * station['station_distance_in_miles']
 
-    # for _ in sorted_dic_idx:
-    #     print(_)
 
-    # for _ in filtered_stations:
-    #     print(_)
+def leg_cost(station, end_idx):
+    # fuel for the leg leaving `station` (its own detour included), at its price
+    miles = end_idx - station['cummulative_idx'] + 2 * station['station_distance_in_miles']
+    return miles / MILES_PER_GALLON * station['station_price']
+
+
+def list_of_stations(nearby_stations, total_distance):
+    # Trip fits on the starting tank: no stops needed.
+    if total_distance <= MAX_CAPACITY:
+        logger.info("Route of %.1f miles fits on one tank; no stops needed", total_distance)
+        return [], 0.0
+
+    stations = generate_filtered_stations(nearby_stations)
+    n = len(stations)
+
+    INF = float('inf')
+    dp = [INF] * n        # dp[j] = cheapest cost to be at station j
+    parent = [-1] * n     # previous stop on that cheapest path (-1 = start)
+
+    for j in range(n):
+        if stations[j]['cummulative_idx'] <= MAX_CAPACITY:
+            dp[j] = 0.0   # first tank is free
+        # only stations within MAX_CAPACITY behind j can possibly reach it
+        i = j - 1
+        while i >= 0 and stations[j]['cummulative_idx'] - stations[i]['cummulative_idx'] <= MAX_CAPACITY:
+            gap = stations[j]['cummulative_idx'] - stations[i]['cummulative_idx']
+            if dp[i] < INF and gap <= reach(stations[i]):
+                candidate = dp[i] + leg_cost(stations[i], stations[j]['cummulative_idx'])
+                if candidate < dp[j]:
+                    dp[j] = candidate
+                    parent[j] = i
+            i -= 1
+
+    # choose the last stop: it must be able to reach the destination
+    total_cost, last = INF, -1
+    for i in range(n):
+        if dp[i] < INF and total_distance - stations[i]['cummulative_idx'] <= reach(stations[i]):
+            candidate = dp[i] + leg_cost(stations[i], total_distance)
+            if candidate < total_cost:
+                total_cost, last = candidate, i
+
+    if last == -1:
+        logger.warning("No feasible fuel stops for a %.1f mile route (%d candidate stations)",
+                       total_distance, n)
+        raise ValueError("No feasible set of fuel stops for this route")
+
     final_list = []
-    total_cost = 0
-    position = 0            # cumulative distance where we currently stand
-    i = 0
-    n = len(filtered_stations)
-    edge_capacity = 0
+    k = last
+    while k != -1:
+        final_list.append(stations[k])
+        k = parent[k]
+    final_list.reverse()
 
-    while position < total_distance:
-
-        if total_distance - position <= MAX_CAPACITY - edge_capacity:
-            break
-
-        intial_price = 1e9
-        intial_station = None
-
-        j = i
-        while j < n and filtered_stations[j]['cummulative_idx'] <= position + MAX_CAPACITY - edge_capacity:
-            if filtered_stations[j]['cummulative_idx'] > position:
-                if filtered_stations[j]['station_price'] < intial_price:
-                    intial_price = filtered_stations[j]['station_price']
-                    intial_station = filtered_stations[j]
-            j += 1
-
-        if intial_station is None:
-            break
-
-        if final_list:
-            prev_stop = final_list[-1]
-            leg_miles = intial_station['cummulative_idx'] - prev_stop['cummulative_idx']
-            detour_miles = 2 * prev_stop['station_distance_in_miles']
-            total_cost += (leg_miles+detour_miles) / MILES_PER_GALLON * prev_stop['station_price']
-
-        final_list.append(intial_station)
-        position = intial_station['cummulative_idx']
-        edge_capacity = 2*intial_station['station_distance_in_miles']
-
-        while i < n and filtered_stations[i]['cummulative_idx'] <= position:
-            i += 1
-
-    if final_list:
-        last_stop = final_list[-1]
-        leg_miles = total_distance - position
-        detour_miles = 2 * last_stop['station_distance_in_miles']
-        total_cost += ((leg_miles + detour_miles) / MILES_PER_GALLON) * last_stop['station_price']
-
-    logger.info("Final Stations Created: %d", len(final_list))
+    logger.info("Final Stations Created: %d, total cost %.2f", len(final_list), total_cost)
     return final_list, round(total_cost, 2)
 
 
