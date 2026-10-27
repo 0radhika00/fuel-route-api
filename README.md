@@ -36,7 +36,7 @@ end=Los Angeles, CA
 | `BUFFER_MILES` | 20 | How far (miles) off the route a station can be and still be considered |
 
 ### Example response (trimmed)
-
+Initial with Greedy ALGO
 ```json
 {
   
@@ -82,3 +82,88 @@ stop at all and costs $0.
 
 - Where greedy can be suboptimal: if the algorithm is forced to always top off to a full tank (not just "enough for the next leg"), then DP does matter — because overbuying at an expensive station now to skip a cheap one 50 miles later becomes a real tradeoff, and that requires comparing full future paths, which greedy can't see. My implementation avoids that whole complication by choosing the "buy exactly enough for the next leg" model, which is also more realistic for cost accounting and keeps greedy essentially correct.
 
+Changing Algo to DP
+
+## Example response (trimmed)
+
+```jsonc
+{
+  "final_stations": [
+    {
+      "cummulative_idx": 484.85,
+      "station_distance_in_miles": 1.92,
+      "station_price": 2.921,
+      "station_name": "KUM & GO #0370",
+      "station_address": "I-80, EXIT 439 & SR-370 Gretna NE"
+    }
+  ],
+  "total_price": 0.0,   // fill in from a real run
+  "geometry": {"type": "LineString", "coordinates": [[-87.63, 41.88], "..."]}
+}
+```
+
+- `cummulative_idx` is the station's position along the route, in miles from the start.
+- `station_distance_in_miles` is how far the station is off the route (one way).
+- `geometry` is a GeoJSON `LineString` you can drop into Leaflet or Mapbox GL.
+
+## How fuel stops are chosen
+
+The problem: choose a subset of candidate stations along the route so
+that no leg exceeds the vehicle's range, minimizing total fuel cost.
+
+**Cost model**
+
+- The vehicle starts with a full tank, so the first leg (start to first stop) is free.
+- Fuel for each later leg is bought at the stop the leg starts from, and
+  billed at that stop's price. The vehicle buys only what it needs to
+  reach the next stop (or the destination), not a forced full tank.
+- Each stop is off the route by some distance `d`. The detour (`2 * d`
+  miles, off and back) costs fuel **and** uses up range, so a station
+  `d` miles off-route leaves `MAX_CAPACITY - 2d` miles of reach.
+- A trip that fits on the starting tank (`total_distance <= MAX_CAPACITY`)
+  needs no stops and costs $0.
+
+**Algorithm: dynamic programming**
+
+Stations are sorted by position along the route. Let `dp[j]` be the
+cheapest cost to be at station `j`:
+
+```
+dp[j] = 0                                   if station j is within the first tank
+dp[j] = min over earlier stations i of
+          dp[i] + leg_cost(i -> j)          if i can reach j (gap <= reach(i))
+answer = min over stations i that can reach the destination of
+          dp[i] + leg_cost(i -> destination)
+```
+
+A `parent` pointer per station is stored so the chosen stops can be
+read back from the best final station. For each station only the
+stations within `MAX_CAPACITY` miles behind it are checked, so the
+running time is O(n x k), where k is the number of candidates within
+one tank's range, not O(n^2) over the whole list.
+
+If no valid set of stops exists (for example, a stretch longer than the
+range with no station in it), `list_of_stations` raises `ValueError`.
+The API returns a 422 with an error message rather than a partial route.
+
+## Why DP instead of a greedy "cheapest in window" rule
+
+An earlier version picked the cheapest station in the next 500 miles at
+each step. That is not optimal, because the cheapest station can be near
+the start and block access to a better one further on.
+
+Counterexample (capacity 500, destination at mile 1300, no detours):
+
+| Station | Mile | Price |
+|---|---|---|
+| A | 100 | $5.00 |
+| B | 490 | $6.00 |
+| C | 900 | $1.00 |
+
+Greedy picks A, B, C and pays **$481**. Skipping A and going straight to
+B, then C, costs **$286**. A is cheaper than B, but stopping there wastes
+reach: B (the pricier one) is far enough along that C, the cheap one,
+becomes reachable from it.
+
+DP compares every valid chain of stops and so finds the $286 route
+without needing a proof that some local rule is optimal.
